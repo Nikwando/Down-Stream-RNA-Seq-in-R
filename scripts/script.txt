@@ -1,0 +1,239 @@
+#Nikwando's pipeline on how to perform logistic regression on a sparse gene count matrix and metadata...
+
+# Install the required libraries if you haven't already
+# install.packages("phyloseq")
+
+# Load the necessary library
+library(phyloseq)
+library(ggplot2)
+library(tidyverse)
+library(rms)
+library(glmnet)
+# Load the abundance data (first table)
+abundances <- read.table('gene_count_matrix.txt', header = TRUE, sep = '\t', row.names = 1)
+
+# Load the metadata (second table)
+meta <- read.table('sample_metadata.txt', header = TRUE, sep = '\t')
+
+# Convert abundance data to a matrix
+otu_mat <- as.matrix(abundances)
+
+# Filter OTU table to only keep rows (taxa) with non-zero values in at least one sample
+otu_mat_filtered <- otu_mat[rowSums(otu_mat > 0) > 0, ]
+
+# Create OTU table (taxa are rows) from the filtered matrix
+otu_table_phy <- otu_table(otu_mat_filtered, taxa_are_rows = TRUE)
+
+# Set the row names in the metadata to be the Sample column
+rownames(meta) <- meta$Sample
+
+# Remove the Sample column as it is now the row names
+meta <- meta[ , -1]
+
+# Create a sample_data object
+sample_data_phy <- sample_data(meta)
+
+# Ensure that the samples match between the OTU table and the metadata
+common_samples <- intersect(colnames(otu_mat_filtered), rownames(meta))
+
+# Subset both to common samples
+otu_table_phy <- prune_samples(common_samples, otu_table_phy)
+sample_data_phy <- sample_data_phy[common_samples, ]
+
+# Create the phyloseq object
+ps <- phyloseq(otu_table_phy, sample_data_phy)
+
+# Print or inspect the phyloseq object
+print(ps)
+
+# Check summary
+summary(ps)
+
+# Check sample names
+sample_names(ps)
+
+# Check OTU names (features)
+taxa_names(ps)
+
+# CLR Transformation
+ps_clr <- microbiome::transform(ps, "clr")
+
+# View the OTU tables before and after transformation
+phyloseq::otu_table(ps)[1:5, 1:5]
+phyloseq::otu_table(ps_clr)[1:5, 1:5]
+
+# PCA via phyloseq
+ord_clr <- phyloseq::ordinate(ps_clr, "RDA")
+
+# Plot scree plot
+phyloseq::plot_scree(ord_clr) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+head(ord_clr$CA$eig)  
+sapply(ord_clr$CA$eig[1:4], function(x) x / sum(ord_clr$CA$eig))
+clr1 <- ord_clr$CA$eig[1] / sum(ord_clr$CA$eig)
+clr2 <- ord_clr$CA$eig[2] / sum(ord_clr$CA$eig)
+phyloseq::plot_ordination(ps, ord_clr, type="Samples", color="Insects") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = Insects), linetype = 2)
+clr_dist_matrix <- phyloseq::distance(ps_clr, method = "euclidean") 
+
+
+# View the eigenvalues for the first few components
+head(ord_clr$CA$eig)
+
+clr_dist_matrix <- phyloseq::distance(ps_clr, method = "euclidean") 
+
+vegan::adonis2(clr_dist_matrix ~ phyloseq::sample_data(ps_clr)$Insects)
+ps_wilcox <- data.frame(t(data.frame(phyloseq::otu_table(ps_clr))))
+View(ps_wilcox)
+ps_wilcox$condition <- phyloseq::sample_data(ps_clr)$Insects
+
+#Define functions to pass to map
+wilcox_model <- function(df){
+  wilcox.test(abund ~ condition, data = df)
+}
+
+
+
+# Define the functions, setting exact = FALSE to handle ties
+wilcox_model <- function(df) {
+  wilcox.test(abund ~ condition, data = df, exact = FALSE)
+}
+
+wilcox_pval <- function(df) {
+  wilcox.test(abund ~ condition, data = df, exact = FALSE)$p.value
+}
+
+# Perform Wilcoxon test on the OTU data
+
+wilcox_results <- ps_wilcox %>%
+  gather(key = OTU, value = abund, -condition) %>%
+  group_by(OTU) %>%
+  nest() %>%
+  mutate(wilcox_test = map(data, wilcox_model),
+         p_value = map(data, wilcox_pval))
+
+# Unnest the results to extract the p-values
+wilcox_results_unnested <- wilcox_results %>%
+  unnest(p_value)
+
+# Show the results
+head(wilcox_results_unnested)
+
+
+# Filter for significant p-values
+significant_results <- wilcox_results_unnested %>%
+  filter(p_value < 0.05)
+
+# Show significant results
+head(significant_results)
+
+# Adjust p-values for multiple testing using FDR
+wilcox_results_unnested <- wilcox_results_unnested %>%
+  mutate(p_adjusted = p.adjust(p_value, method = "fdr"))
+
+# Filter for significant adjusted p-values
+significant_results_adjusted <- wilcox_results_unnested %>%
+  filter(p_adjusted < 0.05)
+
+# Show significant adjusted results
+head(significant_results_adjusted)
+
+print.data.frame(wilcox_results)
+View(wilcox_results)
+aldex2_da <- ALDEx2::aldex(data.frame(phyloseq::otu_table(ps)), phyloseq::sample_data(ps)$Insects, test="t", effect = TRUE, denom="median",exact = FALSE)
+ALDEx2::aldex.plot(aldex2_da, type="MW", test="wilcox", called.cex = 1, cutoff = 0.05)
+sig_aldex2 <- aldex2_da %>%
+  rownames_to_column(var = "OTU") %>%
+  filter(wi.eBH < 0.05) %>%
+  arrange(effect, wi.eBH) %>%
+  dplyr::select(OTU, diff.btw, diff.win, effect, wi.ep, wi.eBH)
+sig_aldex2
+
+
+
+#Generate data.frame
+clr_pcs <- data.frame(
+  "pc1" = ord_clr$CA$u[,1],
+  "pc2" = ord_clr$CA$u[,2],
+  "pc3" = ord_clr$CA$u[,3],
+  "Status" = phyloseq::sample_data(ps_clr)$Insects
+)
+clr_pcs$Status_num <- ifelse(clr_pcs$Status == "Gmellonella", 0, 1)
+head(clr_pcs)
+dd <- datadist(clr_pcs)
+options(datadist = "dd")
+#Plot the unconditional associations
+a <- ggplot(clr_pcs, aes(x = pc1, y = Status_num)) +
+  Hmisc::histSpikeg(Status_num ~ pc1, lowess = TRUE, data = clr_pcs) +
+  labs(x = "\nPC1", y = "Pr(Gmellonella)\n")
+b <- ggplot(clr_pcs, aes(x = pc2, y = Status_num)) +
+  Hmisc::histSpikeg(Status_num ~ pc2, lowess = TRUE, data = clr_pcs) +
+  labs(x = "\nPC2", y = "Pr(Gmellonella)\n")
+c <- ggplot(clr_pcs, aes(x = pc3, y = Status_num)) +
+  Hmisc::histSpikeg(Status_num ~ pc3, lowess = TRUE, data = clr_pcs) +
+  labs(x = "\nPC3", y = "Pr(Gmellonella)\n")
+cowplot::plot_grid(a, b, c, nrow = 2, ncol = 2, scale = .9, labels = "AUTO")
+
+# Install rms if not already installed
+# install.packages("rms")
+
+# Load the rms package
+
+
+# Example of using datadist and rcs
+dd <- datadist(clr_pcs)
+options(datadist = "dd")
+
+# Example of using rcs (restricted cubic splines)
+m1 <- lrm(Status_num ~ rcs(pc1, 3) + rcs(pc2, 3) + rcs(pc3, 3), data = clr_pcs, x = TRUE, y = TRUE)
+#Grid search for penalties
+pentrace(m1, list(simple = c(0, 1, 2), nonlinear = c(0, 100, 200)))
+pen_m1 <- update(m1, penalty = list(simple = 1, nonlinear = 200))
+pen_m1
+ggplot(Predict(pen_m1))
+
+(val <- rms::validate(pen_m1))
+(c_opt_corr <- 0.01 * (val[1, 6] + 1))
+cal <- rms::calibrate(pen_m1, B = 500)
+plot(cal)
+
+# Load necessary libraries
+
+
+# Extract OTU table and convert to matrix, transposing so that rows are samples
+otu_matrix <- t(as.matrix(phyloseq::otu_table(ps_clr)))
+
+# Extract condition (response) and convert to binary numeric (0 for Gmellonella, 1 for others)
+condition <- phyloseq::sample_data(ps_clr)$Insects
+condition_num <- ifelse(condition == "Gmellonella", 0, 1)
+
+# Check that rows in otu_matrix match the length of condition_num
+nrow(otu_matrix) == length(condition_num)  # Should return TRUE
+
+# Fit Lasso logistic regression model
+lasso_fit <- glmnet(otu_matrix, condition_num, family = "binomial", alpha = 1)
+
+# Perform cross-validation for lambda selection
+cv_lasso <- cv.glmnet(otu_matrix, condition_num, family = "binomial", alpha = 1)
+
+# Plot the binomial deviance vs log(lambda)
+plot(cv_lasso)
+
+# Extract optimal lambda
+optimal_lambda <- cv_lasso$lambda.min
+print(optimal_lambda)
+
+
+
+
+
+
+
+
+
+
+
